@@ -6,22 +6,36 @@ App de escritorio (Python + Tkinter) para revisar imágenes de una carpeta una p
 - **Conservar**: deja la imagen en su lugar.
 
 Al llegar a la última imagen se abre una revisión final con scroll, miniaturas y checkboxes para desmarcar las que no quieras borrar. Luego puedes borrar todas las seleccionadas con un solo botón.
+Puedes elegir un archivo dentro de la carpeta para empezar desde ese archivo.
 
 ## Ejecutar
 
 1) Crear entorno e instalar dependencias:
 
 ```powershell
-py -m venv .venv
+python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 2) Iniciar la app:
 
 ```powershell
-py app.py
+python app.py
 ```
+
+## Empaquetar sin dependencias (VLC incluido)
+
+Necesitas VLC instalado en la maquina donde compilas. Luego usa `--onedir` y copia los binarios y plugins.
+
+```powershell
+python -m PyInstaller --onedir --windowed --name trash-image-eraser app.py `
+  --add-binary "C:\\Program Files\\VideoLAN\\VLC\\libvlc.dll;." `
+  --add-binary "C:\\Program Files\\VideoLAN\\VLC\\libvlccore.dll;." `
+  --add-binary "C:\\Program Files\\VideoLAN\\VLC\\plugins;plugins"
+```
+
+El ejecutable quedara en `dist\\trash-image-eraser\\trash-image-eraser.exe` y funcionara sin instalar VLC en el PC destino.
 
 ## Teclas
 
@@ -30,6 +44,12 @@ py app.py
 - `U`: deshacer la última acción
 - Flechas `←` / `→`: navegar
 - `Esc`: salir
+
+## Compatibilidad
+
+- **Imágenes**: `jpg`, `jpeg`, `png`, `bmp`, `gif`, `tif`, `tiff`, `webp`, `heic`
+- **Videos**: `mp4`, `mov`, `mkv`, `avi` (reproductor integrado)
+- **Nota**: para videos necesitas VLC instalado y el paquete `python-vlc` (ya está en `requirements.txt`).
 
 ## Progreso
 
