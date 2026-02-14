@@ -2,8 +2,10 @@
 
 App de escritorio (Python + Tkinter) para revisar imágenes de una carpeta una por una y decidir:
 
-- **Borrar**: mueve la imagen a `_deleted_by_trash_image_eraser` (no borra permanentemente).
+- **Borrar**: marca la imagen para borrarla al final.
 - **Conservar**: deja la imagen en su lugar.
+
+Al llegar a la última imagen se abre una revisión final con scroll, miniaturas y checkboxes para desmarcar las que no quieras borrar. Luego puedes borrar todas las seleccionadas con un solo botón.
 
 ## Ejecutar
 
@@ -23,13 +25,12 @@ py app.py
 
 ## Teclas
 
-- `D` o `Delete`: mover a la carpeta de borrados
+- `D` o `Delete`: marcar para borrar
 - `K` o `Espacio`: conservar
-- `U`: deshacer la última acción (si fue borrado, restaura)
+- `U`: deshacer la última acción
 - Flechas `←` / `→`: navegar
 - `Esc`: salir
 
 ## Progreso
 
 Se guarda en el archivo `.trash_image_eraser_state.json` dentro de la carpeta seleccionada.
-
