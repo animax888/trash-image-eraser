@@ -6,7 +6,8 @@ import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox
+import customtkinter as ctk
 
 try:
     from PIL import Image, ImageOps, ImageTk
@@ -48,11 +49,17 @@ def _vlc_candidate_dirs() -> list[Path]:
     if getattr(sys, "frozen", False):
         exe_dir = Path(sys.executable).parent
         dirs.append(exe_dir)
+        vlcbin_dir = exe_dir / "vlcbin"
+        if vlcbin_dir not in dirs:
+            dirs.append(vlcbin_dir)
         meipass = getattr(sys, "_MEIPASS", None)
         if meipass:
             meipass_dir = Path(meipass)
             if meipass_dir != exe_dir:
                 dirs.append(meipass_dir)
+            vlcbin_meipass = meipass_dir / "vlcbin"
+            if vlcbin_meipass not in dirs and vlcbin_meipass != meipass_dir:
+                dirs.append(vlcbin_meipass)
     return dirs
 
 
@@ -82,6 +89,15 @@ def _prepare_vlc_environment() -> Path | None:
                 plugin_path = None
 
     return plugin_path
+
+
+def _resource_path(*parts: str | Path) -> Path:
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        base = Path(meipass) if meipass else Path(__file__).resolve().parent
+    else:
+        base = Path(__file__).resolve().parent
+    return base.joinpath(*parts)
 
 
 def _decode_image_for_view(path: Path, max_w: int, max_h: int) -> tuple[Image.Image | None, str | None]:
@@ -117,17 +133,29 @@ class Action:
     index_before: int
 
 
-class App(tk.Tk):
+class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Trash Image Eraser")
         self.geometry("1100x750")
         self.minsize(800, 550)
+        icon_path = _resource_path("dependencias", "media", "trash_image_eraser.ico")
+        if icon_path.exists():
+            try:
+                self.iconbitmap(default=str(icon_path))
+            except Exception:
+                pass
+            try:
+                self._icon_image = ImageTk.PhotoImage(Image.open(icon_path))
+                self.iconphoto(True, self._icon_image)
+            except Exception:
+                self._icon_image = None
 
         self.folder: Path | None = None
         self.images: list[Path] = []
         self.index: int = 0
 
+        self._icon_image: ImageTk.PhotoImage | None = None
         self._photo: ImageTk.PhotoImage | None = None
         self._current_image_pil: Image.Image | None = None
         self._history: list[Action] = []
@@ -153,6 +181,7 @@ class App(tk.Tk):
         self._video_available = False
         self._vlc_instance = None
         self._vlc_player = None
+        self._vlc_event_manager = None
         self._video_path: Path | None = None
         self._video_update_job = None
         self._video_session = 0
@@ -170,89 +199,99 @@ class App(tk.Tk):
                     args.append(f"--plugin-path={plugin_path}")
                 self._vlc_instance = vlc.Instance(args)
                 self._vlc_player = self._vlc_instance.media_player_new()
+                self._vlc_event_manager = self._vlc_player.event_manager()
+                self._vlc_event_manager.event_attach(
+                    vlc.EventType.MediaPlayerEndReached, self._on_vlc_end
+                )
                 self._video_available = True
             except Exception:
                 self._vlc_instance = None
                 self._vlc_player = None
+                self._vlc_event_manager = None
 
         self._build_ui()
         self._bind_keys()
 
     # ---------------- UI ----------------
     def _build_ui(self) -> None:
-        root = ttk.Frame(self, padding=10)
-        root.pack(fill=tk.BOTH, expand=True)
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("dark-blue")
+        self.grid_rowconfigure(1, weight=1)
+        self.grid_columnconfigure(0, weight=1)
 
-        top = ttk.Frame(root)
-        top.pack(fill=tk.X)
+        top = ctk.CTkFrame(self)
+        top.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 5))
+        top.grid_columnconfigure(0, weight=1)
 
         self.folder_var = tk.StringVar(value="(Selecciona una carpeta)")
-        ttk.Label(top, textvariable=self.folder_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ctk.CTkLabel(top, textvariable=self.folder_var, anchor="w").grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        ctk.CTkButton(top, text="Elegir archivo o carpeta...", command=self.choose_folder).grid(row=0, column=1, padx=4)
+        ctk.CTkButton(top, text="Reanudar", command=self.resume_if_possible).grid(row=0, column=2, padx=4)
+        ctk.CTkButton(top, text="Reiniciar", command=self.reset_state).grid(row=0, column=3, padx=4)
+        ctk.CTkButton(top, text="Borrar marcadas ahora", command=self._flush_deleted_items).grid(row=0, column=4, padx=4)
+        ctk.CTkButton(top, text="Acerca de", command=self._show_about).grid(row=0, column=5, padx=4)
 
-        ttk.Button(top, text="Elegir archivo o carpeta...", command=self.choose_folder).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(top, text="Reanudar", command=self.resume_if_possible).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(top, text="Reiniciar", command=self.reset_state).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(top, text="Borrar marcadas ahora", command=self._flush_deleted_items).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(top, text="Acerca de", command=self._show_about).pack(side=tk.LEFT, padx=(8, 0))
+        mid = ctk.CTkFrame(self)
+        mid.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 10))
+        mid.grid_rowconfigure(1, weight=1)
+        mid.grid_columnconfigure(0, weight=1)
 
-        mid = ttk.Frame(root)
-        mid.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        strip_frame = ctk.CTkFrame(mid, fg_color="#1a1a1a")
+        strip_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        strip_frame.grid_columnconfigure(0, weight=1)
 
-        strip = ttk.Frame(mid)
-        strip.pack(fill=tk.X, pady=(0, 8))
-
-        self.strip_canvas = tk.Canvas(strip, height=90, bg="#1a1a1a", highlightthickness=0)
-        self.strip_canvas.pack(fill=tk.X, expand=False)
+        self.strip_canvas = tk.Canvas(strip_frame, height=90, bg="#1a1a1a", highlightthickness=0)
+        self.strip_canvas.grid(row=0, column=0, sticky="ew")
 
         self.canvas = tk.Canvas(mid, bg="#111111", highlightthickness=0)
-        self.canvas.pack(fill=tk.BOTH, expand=True)
+        self.canvas.grid(row=1, column=0, sticky="nsew")
 
-        self.video_controls = ttk.Frame(mid)
-        self.video_controls.pack(fill=tk.X, pady=(8, 0))
+        self.video_controls = ctk.CTkFrame(mid)
+        self.video_controls.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        self.video_controls.grid_columnconfigure(2, weight=1)
 
         self.play_pause_text = tk.StringVar(value="Play")
-        self.play_pause_btn = ttk.Button(
+        self.play_pause_btn = ctk.CTkButton(
             self.video_controls,
             textvariable=self.play_pause_text,
             command=self.toggle_play_pause,
-            state=tk.NORMAL,
+            state="normal",
         )
-        self.play_pause_btn.pack(side=tk.LEFT)
+        self.play_pause_btn.grid(row=0, column=0, padx=(8, 0))
 
-        ttk.Label(self.video_controls, textvariable=self._time_var).pack(side=tk.LEFT, padx=(8, 8))
+        ctk.CTkLabel(self.video_controls, textvariable=self._time_var).grid(row=0, column=1, padx=(8, 8))
 
-        self.progress_scale = ttk.Scale(
+        self.progress_scale = ctk.CTkSlider(
             self.video_controls,
             from_=0,
             to=1,
-            orient=tk.HORIZONTAL,
-            variable=self._progress_var,
             command=self._on_seek_change,
+            variable=self._progress_var,
         )
-        self.progress_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.progress_scale.grid(row=0, column=2, sticky="ew")
         self.progress_scale.bind("<ButtonPress-1>", self._on_seek_start)
         self.progress_scale.bind("<ButtonRelease-1>", self._on_seek_end)
 
-        ttk.Label(self.video_controls, text="Vol").pack(side=tk.LEFT, padx=(8, 0))
-        self.volume_scale = ttk.Scale(
+        ctk.CTkLabel(self.video_controls, text="Vol").grid(row=0, column=3, padx=(8, 0))
+        self.volume_scale = ctk.CTkSlider(
             self.video_controls,
             from_=0,
             to=100,
-            orient=tk.HORIZONTAL,
-            variable=self._volume_var,
             command=self._on_volume_change,
+            variable=self._volume_var,
         )
-        self.volume_scale.pack(side=tk.LEFT)
-        self.video_controls.pack_forget()
+        self.volume_scale.grid(row=0, column=4, sticky="ew", padx=(4, 8))
+        self.video_controls.grid_columnconfigure(4, weight=0)
+        self.video_controls.grid_remove()
 
-        bottom = ttk.Frame(root)
-        bottom.pack(fill=tk.X, pady=(10, 0))
+        bottom = ctk.CTkFrame(self)
+        bottom.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 10))
+        bottom.grid_columnconfigure(0, weight=1)
 
         self.status_var = tk.StringVar(value="Listo.")
-        ttk.Label(bottom, textvariable=self.status_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
-
+        ctk.CTkLabel(bottom, textvariable=self.status_var, anchor="w").grid(row=0, column=0, sticky="ew")
         hints = "Teclas: [D] marcar para borrar | [K] conservar | [U] deshacer | [Esc] salir"
-        ttk.Label(bottom, text=hints).pack(side=tk.RIGHT)
+        ctk.CTkLabel(bottom, text=hints, anchor="e").grid(row=0, column=1, sticky="e")
 
         self.canvas.bind("<Configure>", self._on_canvas_configure)
         self.strip_canvas.bind("<Configure>", lambda _e: self._schedule_strip_render())
@@ -710,10 +749,10 @@ class App(tk.Tk):
     def _show_video_controls(self, show: bool) -> None:
         if show:
             if not self.video_controls.winfo_ismapped():
-                self.video_controls.pack(fill=tk.X, pady=(8, 0))
+                self.video_controls.grid()
         else:
             if self.video_controls.winfo_ismapped():
-                self.video_controls.pack_forget()
+                self.video_controls.grid_remove()
 
     def _set_video_output(self) -> None:
         if not self._vlc_player:
@@ -729,6 +768,23 @@ class App(tk.Tk):
                 self._vlc_player.set_xwindow(handle)
         except Exception:
             return
+
+    def _on_vlc_end(self, _event) -> None:
+        session_id = self._video_session
+        self.after(0, lambda: self._restart_video_if_current(session_id))
+
+    def _restart_video_if_current(self, session_id: int) -> None:
+        if self._is_closing or not self._vlc_player or self._video_path is None:
+            return
+        if session_id != self._video_session:
+            return
+        try:
+            self._vlc_player.set_time(0)
+            self._vlc_player.play()
+            self.play_pause_text.set("Pausa")
+            self._start_video_updates(self._video_session)
+        except Exception:
+            pass
 
     def _play_video(self, path: Path) -> None:
         if not self._vlc_player or not self._vlc_instance:
@@ -993,52 +1049,54 @@ class App(tk.Tk):
             self._save_state()
             return
 
-        win = tk.Toplevel(self)
+        win = ctk.CTkToplevel(self)
         self._review_window = win
         win.title("Revisión final de borrado")
         win.geometry("980x680")
         win.minsize(720, 480)
         win.protocol("WM_DELETE_WINDOW", self._close_review_window)
 
-        root = ttk.Frame(win, padding=10)
-        root.pack(fill=tk.BOTH, expand=True)
+        root = ctk.CTkFrame(win, fg_color="transparent")
+        root.pack(fill="both", expand=True, padx=10, pady=10)
 
-        ttk.Label(
+        ctk.CTkLabel(
             root,
             text=(
                 "Revisa rápido las imágenes marcadas para borrar. "
                 "Desmarca las que quieras conservar y pulsa el botón final."
             ),
-        ).pack(fill=tk.X)
+            wraplength=640,
+            justify="left",
+        ).pack(fill="x")
 
-        container = ttk.Frame(root)
-        container.pack(fill=tk.BOTH, expand=True, pady=(10, 10))
+        container = ctk.CTkFrame(root)
+        container.pack(fill="both", expand=True, pady=(10, 10))
 
         canvas = tk.Canvas(container, highlightthickness=0)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar = ttk.Scrollbar(container, orient=tk.VERTICAL, command=canvas.yview)
+        scrollbar = ctk.CTkScrollbar(container, orientation="vertical", command=canvas.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         canvas.configure(yscrollcommand=scrollbar.set)
 
-        list_frame = ttk.Frame(canvas)
+        list_frame = ctk.CTkFrame(canvas, fg_color="transparent")
         window_id = canvas.create_window((0, 0), window=list_frame, anchor="nw")
         list_frame.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
 
         self._review_selection = {}
         self._review_thumb_refs = []
-        tiles: list[ttk.Frame] = []
+        tiles: list[ctk.CTkFrame] = []
         tile_width = 180
         load_previews = len(review_items) <= 120
 
         for _idx, (rel, path) in enumerate(review_items, start=1):
-            tile = ttk.Frame(list_frame, padding=(6, 6))
+            tile = ctk.CTkFrame(list_frame, fg_color="transparent", corner_radius=8, pady=6)
             tiles.append(tile)
 
             var = tk.BooleanVar(value=True)
             self._review_selection[rel] = var
-            ttk.Checkbutton(tile, variable=var).pack(anchor="w")
+            ctk.CTkCheckBox(tile, text="", variable=var).pack(anchor="w")
 
-            preview_label = ttk.Label(tile, text="Sin vista", anchor="center")
+            preview_label = ctk.CTkLabel(tile, text="Sin vista", anchor="center", wraplength=150)
             preview_label.pack()
             if self._is_video(path):
                 preview_label.configure(text="Video")
@@ -1056,8 +1114,8 @@ class App(tk.Tk):
             else:
                 preview_label.configure(text="Sin preview")
 
-            ttk.Label(tile, text=path.name, wraplength=160, justify="center").pack()
-            ttk.Label(tile, text=rel, wraplength=160, justify="center").pack()
+            ctk.CTkLabel(tile, text=path.name, wraplength=160, justify="center").pack()
+            ctk.CTkLabel(tile, text=rel, wraplength=160, justify="center").pack()
 
         def _layout_tiles() -> None:
             width = max(1, canvas.winfo_width())
@@ -1078,14 +1136,14 @@ class App(tk.Tk):
             ),
         )
 
-        buttons = ttk.Frame(root)
-        buttons.pack(fill=tk.X)
-        ttk.Button(buttons, text="Cerrar", command=self._close_review_window).pack(side=tk.RIGHT)
-        ttk.Button(
+        buttons = ctk.CTkFrame(root, fg_color="transparent")
+        buttons.pack(fill="x")
+        ctk.CTkButton(buttons, text="Cerrar", command=self._close_review_window).pack(side="right", padx=8)
+        ctk.CTkButton(
             buttons,
             text="Borrar todas",
             command=self._delete_selected_from_review,
-        ).pack(side=tk.RIGHT, padx=(0, 8))
+        ).pack(side="right", padx=(0, 8))
 
         self.status_var.set(
             f"Fin de revisión: {len(review_items)} imágenes marcadas. Revisa y confirma el borrado."

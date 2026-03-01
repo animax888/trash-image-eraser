@@ -26,16 +26,29 @@ python app.py
 
 ## Empaquetar sin dependencias (VLC incluido)
 
-Necesitas VLC instalado en la maquina donde compilas. Luego usa `--onedir` y copia los binarios y plugins.
+VLC debe estar instalado en el equipo donde compilas, porque el `.spec` (`trash-image-eraser.spec`) recoge `libvlc`, `libvlccore` y la carpeta `plugins`. Para compilar usa:
 
 ```powershell
-python -m PyInstaller --onedir --windowed --name trash-image-eraser app.py `
-  --add-binary "C:\\Program Files\\VideoLAN\\VLC\\libvlc.dll;." `
-  --add-binary "C:\\Program Files\\VideoLAN\\VLC\\libvlccore.dll;." `
-  --add-binary "C:\\Program Files\\VideoLAN\\VLC\\plugins;plugins"
+python -m pip install pyinstaller
+pyinstaller trash-image-eraser.spec
 ```
 
-El ejecutable quedara en `dist\\trash-image-eraser\\trash-image-eraser.exe` y funcionara sin instalar VLC en el PC destino.
+Si VLC está en otra ruta, establece `VLC_HOME` antes del comando:
+
+```powershell
+$env:VLC_HOME = "D:\\Program Files\\VideoLAN\\VLC"
+pyinstaller trash-image-eraser.spec
+```
+
+El resultado aparece en `dist\\trash-image-eraser\\trash-image-eraser.exe` y los archivos de VLC quedan en `_internal\\vlcbin\\` (incluyendo `plugins\\`).
+
+El `.spec` incluye `dependencias/media/trash_image_eraser.ico` y activa el runtime hook `hooks/rth_replace_customtkinter_icon.py`, que sobrescribe `customtkinter/assets/icons/CustomTkinter_icon_Windows.ico` dentro del bundle para que la ventana y la barra de tareas usen tu logo personalizado.
+
+El `.spec` coloca siempre `libvlc.dll`, `libvlccore.dll` y la carpeta `plugins` dentro de `vlcbin/` en el bundle, por lo que en `onedir` lo verás bajo `_internal\\vlcbin\\`.
+
+## Compilación offline con carpeta `dependencias`
+
+Si el equipo de build no tiene VLC, coloca `libvlc.dll`, `libvlccore.dll` y la carpeta `plugins` bajo `dependencias/vlc/` (sigue la guía en `dependencias/README.md`). El icono y los recursos también vive en `dependencias/media/`, por lo que el `.spec` los toma de allí antes de mirar `VLC_HOME` y puedes compilar sin instalar VLC en cada máquina.
 
 ## Teclas
 
