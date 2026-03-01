@@ -44,6 +44,8 @@ El ejecutable quedara en `dist\\trash-image-eraser\\trash-image-eraser.exe` y fu
 - `U`: deshacer la última acción
 - Flechas `←` / `→`: navegar
 - `Esc`: salir
+- Botón `Borrar marcadas ahora`: mueve todos los archivos con marca de eliminación al directorio `_deleted_by_trash_image_eraser` sin esperar a cerrar la revisión.
+- Botón `Acerca de`: muestra instrucciones rápidas sobre los atajos y controles.
 
 ## Compatibilidad
 

@@ -192,6 +192,8 @@ class App(tk.Tk):
         ttk.Button(top, text="Elegir archivo o carpeta...", command=self.choose_folder).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(top, text="Reanudar", command=self.resume_if_possible).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(top, text="Reiniciar", command=self.reset_state).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(top, text="Borrar marcadas ahora", command=self._flush_deleted_items).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(top, text="Acerca de", command=self._show_about).pack(side=tk.LEFT, padx=(8, 0))
 
         mid = ttk.Frame(root)
         mid.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
@@ -1095,6 +1097,74 @@ class App(tk.Tk):
         self._review_window = None
         self._review_selection = {}
         self._review_thumb_refs = []
+
+    def _flush_deleted_items(self) -> None:
+        if not self.folder:
+            return
+        if not self._deleted_set:
+            messagebox.showinfo("Borrar marcadas", "No hay imágenes marcadas para borrar.")
+            return
+        deleted_dir = self._deleted_dir()
+        if not deleted_dir:
+            return
+        confirmed = messagebox.askyesno(
+            "Borrar marcadas",
+            f"¿Mover {len(self._deleted_set)} imágenes ya marcadas a {DELETED_DIRNAME}?",
+        )
+        if not confirmed:
+            return
+        deleted_dir.mkdir(parents=True, exist_ok=True)
+        moved: list[str] = []
+        failed: list[str] = []
+        for rel in sorted(self._deleted_set):
+            src = self.folder / rel
+            if not src.exists():
+                failed.append(f"{rel} (ya no existe)")
+                continue
+            target = self._unique_target(deleted_dir / src.name)
+            try:
+                shutil.move(str(src), str(target))
+            except Exception as exc:
+                failed.append(f"{rel} ({exc})")
+                continue
+            moved.append(rel)
+        moved_set = set(moved)
+        self._deleted_set.difference_update(moved_set)
+        self._kept_set.difference_update(moved_set)
+        self.images = [p for p in self.images if self._rel(p) not in moved_set]
+        if self.index >= len(self.images):
+            self.index = max(0, len(self.images) - 1)
+        self._save_state()
+        self._history.clear()
+        if failed:
+            messagebox.showwarning(
+                "Borrado parcial",
+                "Algunas imágenes no se pudieron mover:\n" + "\n".join(failed[:10]),
+            )
+        if moved:
+            self.status_var.set(f"Movidas {len(moved)} imágenes a {DELETED_DIRNAME}.")
+        else:
+            self.status_var.set("No se movió ninguna imagen.")
+        if self.images:
+            self._schedule_show_current()
+        else:
+            self._clear_canvas("Sin imágenes")
+            self.strip_canvas.delete("all")
+
+    def _show_about(self) -> None:
+        messagebox.showinfo(
+            "Acerca de Trash Image Eraser",
+            (
+                "Revisa imágenes/video y decide qué hacer con cada archivo.\n"
+                "- `D` / `Delete`: marcar para borrar.\n"
+                "- `K` / `Espacio`: marcar para conservar.\n"
+                "- `U`: deshacer última acción.\n"
+                "- Flechas `←` / `→`: navegar.\n"
+                "- `Borrar marcadas ahora`: mueve ya los archivos con marca de borrado al directorio de eliminados.\n"
+                "- El reproductor de video ofrece barra de progreso, pausa y volumen.\n"
+                "- El progreso se guarda en `.trash_image_eraser_state.json` dentro de la carpeta revisada."
+            ),
+        )
 
     def _delete_selected_from_review(self) -> None:
         if not self.folder:
