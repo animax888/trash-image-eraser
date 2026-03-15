@@ -1,27 +1,11 @@
-import shutil
-import sys
-from pathlib import Path
+"""Deprecated runtime hook.
 
+Icon replacement is now handled at build-time in `trash-image-eraser.spec`.
+This file remains only for backwards compatibility with older build scripts.
+"""
 
-def _replace_ctk_icon() -> None:
-    if not getattr(sys, "frozen", False):
-        return
+import logging
 
-    meipass = getattr(sys, "_MEIPASS", None)
-    if not meipass:
-        return
-
-    base = Path(meipass)
-    src = base / "trash_image_eraser.ico"
-    dest = base / "customtkinter" / "assets" / "icons" / "CustomTkinter_icon_Windows.ico"
-
-    try:
-        if not src.exists():
-            return
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(src, dest)
-    except Exception:
-        pass
-
-
-_replace_ctk_icon()
+logging.getLogger("trash_image_eraser").debug(
+    "Runtime hook rth_replace_customtkinter_icon.py is deprecated and does nothing."
+)

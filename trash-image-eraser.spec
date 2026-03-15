@@ -4,7 +4,7 @@ from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_submodules
 
-project_root = Path.cwd()
+project_root = Path(globals().get("SPECPATH") or os.getcwd()).resolve()
 local_vlc = project_root / "dependencias" / "vlc"
 if (local_vlc / "libvlc.dll").exists():
     vlc_home = local_vlc
@@ -18,8 +18,8 @@ binaries = []
 datas = []
 if icon_file.exists():
     datas.append((str(icon_file), "."))
-
-runtime_hooks = ["hooks/rth_replace_customtkinter_icon.py"]
+    datas.append((str(icon_file), "dependencias/media"))
+    datas.append((str(icon_file), "customtkinter/assets/icons"))
 
 
 def _add_tree(root: Path, prefix: str, datas_list: list[tuple[str, str]]) -> None:
@@ -46,7 +46,7 @@ a = Analysis(
     datas=datas,
     hiddenimports=collect_submodules("customtkinter"),
     hookspath=[],
-    runtime_hooks=runtime_hooks,
+    runtime_hooks=[],
     cipher=block_cipher,
     noarchive=False,
 )

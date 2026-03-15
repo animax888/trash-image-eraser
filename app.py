@@ -1,12 +1,17 @@
 import json
+import logging
 import os
+import queue
 import shutil
 import sys
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from tkinter import filedialog, messagebox
+from typing import Callable
+
 import customtkinter as ctk
 
 try:
@@ -36,6 +41,152 @@ STATE_FILENAME = ".trash_image_eraser_state.json"
 DELETED_DIRNAME = "_deleted_by_trash_image_eraser"
 
 
+def _logging_base_dir() -> Path:
+    if os.name == "nt":
+        return Path(os.environ.get("LOCALAPPDATA") or Path.home())
+    state_home = os.environ.get("XDG_STATE_HOME")
+    if state_home:
+        return Path(state_home)
+    return Path.home() / ".local" / "state"
+
+
+def _configure_logger() -> logging.Logger:
+    logger = logging.getLogger("trash_image_eraser")
+    if logger.handlers:
+        return logger
+
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    try:
+        log_dir = _logging_base_dir() / "trash-image-eraser"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            log_dir / "app.log",
+            maxBytes=1_000_000,
+            backupCount=3,
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    except Exception:
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(stream_handler)
+    return logger
+
+
+LOGGER = _configure_logger()
+
+
+def _safe_int(value: object, default: int = 0) -> int:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+def scan_media_files(
+    folder: Path,
+    media_exts: set[str] | None = None,
+    deleted_dirname: str = DELETED_DIRNAME,
+) -> list[Path]:
+    exts = media_exts or MEDIA_EXTS
+    deleted_dir = folder / deleted_dirname
+    results = [
+        p
+        for p in folder.rglob("*")
+        if p.is_file() and p.suffix.lower() in exts and deleted_dir not in p.parents
+    ]
+    return sorted(results)
+
+
+def _safe_relative(path: Path, folder: Path) -> str:
+    try:
+        return str(path.relative_to(folder))
+    except Exception:
+        return str(path)
+
+
+def has_state_progress(state: dict) -> bool:
+    return bool(state.get("kept") or state.get("deleted") or _safe_int(state.get("index", 0), 0) > 0)
+
+
+def sanitize_state_payload(state: dict, files: list[Path], folder: Path) -> dict:
+    valid_rel = {_safe_relative(path, folder) for path in files}
+    raw_deleted = state.get("deleted", [])
+    raw_kept = state.get("kept", [])
+    if not isinstance(raw_deleted, list):
+        raw_deleted = []
+    if not isinstance(raw_kept, list):
+        raw_kept = []
+    deleted = {str(rel) for rel in raw_deleted if str(rel) in valid_rel}
+    kept = {str(rel) for rel in raw_kept if str(rel) in valid_rel}
+    kept.difference_update(deleted)
+    index = _safe_int(state.get("index", 0), 0)
+    if files:
+        index = max(0, min(index, len(files) - 1))
+    else:
+        index = 0
+    return {
+        "index": index,
+        "kept": sorted(kept),
+        "deleted": sorted(deleted),
+    }
+
+
+def resolve_initial_index(
+    files: list[Path],
+    state: dict,
+    start_path: Path | None,
+) -> int:
+    if not files:
+        return 0
+    if has_state_progress(state):
+        return max(0, min(_safe_int(state.get("index", 0), 0), len(files) - 1))
+    if start_path is None:
+        return 0
+    for idx, candidate in enumerate(files):
+        try:
+            if candidate.samefile(start_path):
+                return idx
+        except Exception:
+            if candidate == start_path:
+                return idx
+    return 0
+
+
+def unique_target_path(target: Path) -> Path:
+    if not target.exists():
+        return target
+    stem = target.stem
+    suffix = target.suffix
+    parent = target.parent
+    i = 1
+    while True:
+        candidate = parent / f"{stem} ({i}){suffix}"
+        if not candidate.exists():
+            return candidate
+        i += 1
+
+
+def update_marks_after_move(
+    kept: set[str],
+    deleted: set[str],
+    moved: set[str],
+    unselected: set[str] | None = None,
+) -> tuple[set[str], set[str]]:
+    next_kept = set(kept)
+    next_deleted = set(deleted)
+    unselected_set = set(unselected or set())
+
+    if unselected_set:
+        next_kept.update(unselected_set)
+    next_deleted.difference_update(moved | unselected_set)
+    next_kept.difference_update(moved)
+    return next_kept, next_deleted
+
+
 def _prepend_env_path(path: Path) -> None:
     value = str(path)
     current = os.environ.get("PATH", "")
@@ -60,6 +211,17 @@ def _vlc_candidate_dirs() -> list[Path]:
             vlcbin_meipass = meipass_dir / "vlcbin"
             if vlcbin_meipass not in dirs and vlcbin_meipass != meipass_dir:
                 dirs.append(vlcbin_meipass)
+    else:
+        root = Path(__file__).resolve().parent
+        local_vlc = root / "dependencias" / "vlc"
+        if local_vlc.exists():
+            dirs.append(local_vlc)
+
+    env_vlc_home = os.environ.get("VLC_HOME")
+    if env_vlc_home:
+        env_path = Path(env_vlc_home)
+        if env_path not in dirs:
+            dirs.append(env_path)
     return dirs
 
 
@@ -74,7 +236,7 @@ def _prepare_vlc_environment() -> Path | None:
         candidate = base / "plugins"
         if candidate.is_dir():
             plugin_path = candidate
-            os.environ.setdefault("VLC_PLUGIN_PATH", str(candidate))
+            os.environ["VLC_PLUGIN_PATH"] = str(candidate)
             break
 
     if plugin_path is None:
@@ -86,6 +248,7 @@ def _prepare_vlc_environment() -> Path | None:
                 if first_path.is_dir():
                     plugin_path = first_path
             except Exception:
+                LOGGER.exception("Error preparando VLC_PLUGIN_PATH")
                 plugin_path = None
 
     return plugin_path
@@ -98,6 +261,34 @@ def _resource_path(*parts: str | Path) -> Path:
     else:
         base = Path(__file__).resolve().parent
     return base.joinpath(*parts)
+
+
+def _resolve_icon_path() -> Path | None:
+    icon_name = "trash_image_eraser.ico"
+    root = Path(__file__).resolve().parent
+    candidates = [
+        _resource_path("dependencias", "media", icon_name),
+        _resource_path(icon_name),
+        root / "dependencias" / "media" / icon_name,
+        root / icon_name,
+    ]
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).parent
+        candidates.extend(
+            [
+                exe_dir / "dependencias" / "media" / icon_name,
+                exe_dir / icon_name,
+            ]
+        )
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def _decode_image_for_view(path: Path, max_w: int, max_h: int) -> tuple[Image.Image | None, str | None]:
@@ -139,40 +330,43 @@ class App(ctk.CTk):
         self.title("Trash Image Eraser")
         self.geometry("1100x750")
         self.minsize(800, 550)
-        icon_path = _resource_path("dependencias", "media", "trash_image_eraser.ico")
-        if icon_path.exists():
+        self._icon_image: ImageTk.PhotoImage | None = None
+        icon_path = _resolve_icon_path()
+        if icon_path:
             try:
                 self.iconbitmap(default=str(icon_path))
             except Exception:
-                pass
+                LOGGER.debug("No se pudo aplicar iconbitmap desde %s", icon_path, exc_info=True)
             try:
-                self._icon_image = ImageTk.PhotoImage(Image.open(icon_path))
+                with Image.open(icon_path) as icon_file:
+                    self._icon_image = ImageTk.PhotoImage(icon_file.copy())
                 self.iconphoto(True, self._icon_image)
             except Exception:
-                self._icon_image = None
+                LOGGER.debug("No se pudo aplicar iconphoto desde %s", icon_path, exc_info=True)
 
         self.folder: Path | None = None
         self.images: list[Path] = []
         self.index: int = 0
 
-        self._icon_image: ImageTk.PhotoImage | None = None
         self._photo: ImageTk.PhotoImage | None = None
-        self._current_image_pil: Image.Image | None = None
         self._history: list[Action] = []
         self._review_window: tk.Toplevel | None = None
         self._review_selection: dict[str, tk.BooleanVar] = {}
-        self._review_thumb_refs: list[ImageTk.PhotoImage] = []
         self._thumb_cache: dict[tuple[Path, int], ImageTk.PhotoImage] = {}
+        self._thumb_waiters: dict[tuple[Path, int], list[Callable[[ImageTk.PhotoImage], None]]] = {}
         self._thumb_placeholder = ImageTk.PhotoImage(Image.new("RGB", (64, 64), "#333333"))
+        self._review_thumb_placeholder = ImageTk.PhotoImage(Image.new("RGB", (150, 150), "#333333"))
         self._thumb_pending: set[tuple[Path, int]] = set()
         self._display_cache: dict[tuple[Path, int, int], Image.Image] = {}
         self._display_loading_token = 0
         self._media_generation = 0
+        self._scan_generation = 0
         self._resize_job: str | None = None
         self._show_job: str | None = None
         self._strip_render_job: str | None = None
         self._current_image_path: Path | None = None
         self._worker = ThreadPoolExecutor(max_workers=2, thread_name_prefix="media-loader")
+        self._scan_worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="media-scan")
         self._kept_set: set[str] = set()
         self._deleted_set: set[str] = set()
         self._state_save_job: str | None = None
@@ -182,8 +376,10 @@ class App(ctk.CTk):
         self._vlc_instance = None
         self._vlc_player = None
         self._vlc_event_manager = None
+        self._vlc_events: queue.SimpleQueue[tuple[str, int]] = queue.SimpleQueue()
+        self._vlc_event_job: str | None = None
         self._video_path: Path | None = None
-        self._video_update_job = None
+        self._video_update_job: str | None = None
         self._video_session = 0
         self._seeking = False
         self._duration_ms = 0
@@ -205,12 +401,15 @@ class App(ctk.CTk):
                 )
                 self._video_available = True
             except Exception:
+                LOGGER.exception("No se pudo inicializar VLC")
                 self._vlc_instance = None
                 self._vlc_player = None
                 self._vlc_event_manager = None
 
         self._build_ui()
         self._bind_keys()
+        if self._video_available:
+            self._start_vlc_event_poller()
 
     # ---------------- UI ----------------
     def _build_ui(self) -> None:
@@ -332,6 +531,7 @@ class App(ctk.CTk):
         try:
             return json.loads(state_path.read_text(encoding="utf-8"))
         except Exception:
+            LOGGER.exception("No se pudo leer el estado en %s", state_path)
             return {"index": 0, "kept": [], "deleted": []}
 
     def _state_payload(self) -> dict:
@@ -361,7 +561,7 @@ class App(ctk.CTk):
             )
             self._state_dirty = False
         except Exception:
-            pass
+            LOGGER.exception("No se pudo guardar el estado en %s", state_path)
 
     def _schedule_state_save(self, immediate: bool = False) -> None:
         self._state_dirty = True
@@ -370,7 +570,7 @@ class App(ctk.CTk):
                 try:
                     self.after_cancel(self._state_save_job)
                 except Exception:
-                    pass
+                    LOGGER.debug("No se pudo cancelar _state_save_job", exc_info=True)
                 self._state_save_job = None
             self._flush_state_to_disk()
             return
@@ -410,60 +610,104 @@ class App(ctk.CTk):
         self.folder_var.set(str(folder))
         self._history.clear()
         self._thumb_cache.clear()
+        self._thumb_waiters.clear()
         self._thumb_pending.clear()
         self._display_cache.clear()
         self._display_loading_token += 1
         self._media_generation += 1
+        self._scan_generation += 1
+        current_scan = self._scan_generation
         self._stop_video()
 
         deleted_dir = self._deleted_dir()
         if deleted_dir:
             deleted_dir.mkdir(parents=True, exist_ok=True)
 
-        all_images = sorted(
-            [p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in MEDIA_EXTS]
-        )
-
-        # Exclude images already moved to deleted dir
-        if deleted_dir:
-            all_images = [p for p in all_images if deleted_dir not in p.parents]
-
-        self.images = all_images
+        self.images = []
         self.index = 0
-        self._apply_state(self._load_state())
-        if start_path:
-            for i, path in enumerate(self.images):
-                try:
-                    if path.samefile(start_path):
-                        self.index = i
-                        break
-                except Exception:
-                    if path == start_path:
-                        self.index = i
-                        break
+        self._kept_set.clear()
+        self._deleted_set.clear()
+        self.strip_canvas.delete("all")
+        self._clear_canvas("Escaneando medios...")
+        self.status_var.set("Escaneando carpeta...")
 
+        future = self._scan_worker.submit(scan_media_files, folder, MEDIA_EXTS, DELETED_DIRNAME)
+
+        def _apply_scan() -> None:
+            if self._is_closing or current_scan != self._scan_generation:
+                return
+            if self.folder != folder:
+                return
+            try:
+                media_files = future.result()
+            except Exception:
+                LOGGER.exception("Error escaneando carpeta %s", folder)
+                self.status_var.set("No se pudo escanear la carpeta seleccionada.")
+                self._clear_canvas("Error al escanear")
+                self.strip_canvas.delete("all")
+                return
+            self._finalize_open_folder(folder, media_files, start_path)
+
+        def _dispatch(_fut: object) -> None:
+            try:
+                self.after(0, _apply_scan)
+            except Exception:
+                LOGGER.debug("No se pudo despachar el resultado del escaneo", exc_info=True)
+
+        future.add_done_callback(_dispatch)
+
+    def _finalize_open_folder(
+        self,
+        folder: Path,
+        media_files: list[Path],
+        start_path: Path | None,
+    ) -> None:
+        if self._is_closing or self.folder != folder:
+            return
+
+        self.images = media_files
         if not self.images:
+            self.index = 0
+            self._kept_set.clear()
+            self._deleted_set.clear()
             self.status_var.set("No encontré archivos compatibles en esa carpeta.")
             self._clear_canvas("Sin medios")
             self.strip_canvas.delete("all")
             return
 
-        if start_path:
+        raw_state = self._load_state()
+        state = sanitize_state_payload(raw_state, self.images, folder)
+        self._apply_state(state)
+        self.index = resolve_initial_index(self.images, state, start_path)
+        resumed = has_state_progress(state)
+
+        if resumed:
             self.status_var.set(
-                f"{len(self.images)} archivos compatibles encontrados. Empezando desde el seleccionado."
+                f"{len(self.images)} archivos encontrados. Reanudado automáticamente en {self.index + 1}/{len(self.images)}."
+            )
+        elif start_path:
+            self.status_var.set(
+                f"{len(self.images)} archivos encontrados. Empezando desde el seleccionado."
             )
         else:
-            self.status_var.set(f"{len(self.images)} archivos compatibles encontrados. Empezando desde el primero.")
-        self._save_state()
+            self.status_var.set(
+                f"{len(self.images)} archivos encontrados. Empezando desde el primero."
+            )
         self._schedule_show_current()
 
     def resume_if_possible(self) -> None:
         if not self.folder:
             messagebox.showinfo("Reanudar", "Primero elige una carpeta.")
             return
-        state = self._load_state()
+        if not self.images:
+            messagebox.showinfo("Reanudar", "No hay medios cargados todavía.")
+            return
+        state = sanitize_state_payload(self._load_state(), self.images, self.folder)
+        if not has_state_progress(state):
+            messagebox.showinfo("Reanudar", "No hay progreso guardado para esta carpeta.")
+            return
         self._apply_state(state)
-        saved_index = int(state.get("index", 0) or 0)
+        saved_index = _safe_int(state.get("index", 0), 0)
         saved_index = max(0, min(saved_index, max(0, len(self.images) - 1)))
         self.index = saved_index
         self.status_var.set(f"Reanudado en {self.index + 1}/{len(self.images)}.")
@@ -477,12 +721,21 @@ class App(ctk.CTk):
         self._close_review_window()
         state_path = self._state_path()
         if state_path and state_path.exists():
-            state_path.unlink(missing_ok=True)
+            try:
+                state_path.unlink(missing_ok=True)
+            except Exception:
+                LOGGER.exception("No se pudo borrar estado %s", state_path)
         self.index = 0
         self._history.clear()
         self._kept_set.clear()
         self._deleted_set.clear()
-        self._schedule_state_save(immediate=True)
+        if self._state_save_job is not None:
+            try:
+                self.after_cancel(self._state_save_job)
+            except Exception:
+                LOGGER.debug("No se pudo cancelar _state_save_job en reset", exc_info=True)
+            self._state_save_job = None
+        self._state_dirty = False
         self.status_var.set("Progreso reiniciado.")
         self._schedule_show_current()
 
@@ -583,7 +836,7 @@ class App(ctk.CTk):
             try:
                 self.after_cancel(self._show_job)
             except Exception:
-                pass
+                LOGGER.debug("No se pudo cancelar _show_job", exc_info=True)
             self._show_job = None
         self._show_job = self.after(delay_ms, self._run_show_current)
 
@@ -601,7 +854,6 @@ class App(ctk.CTk):
         self._display_loading_token += 1
         if self._is_video(p):
             self._current_image_path = None
-            self._current_image_pil = None
             if self._video_available:
                 self._clear_canvas()
                 self._play_video(p)
@@ -634,7 +886,7 @@ class App(ctk.CTk):
             try:
                 self.after_cancel(self._resize_job)
             except Exception:
-                pass
+                LOGGER.debug("No se pudo cancelar _resize_job", exc_info=True)
         self._resize_job = self.after(120, self._redraw_current)
 
     def _display_cache_key(self, path: Path, max_w: int, max_h: int) -> tuple[Path, int, int]:
@@ -659,7 +911,6 @@ class App(ctk.CTk):
         cache_key = self._display_cache_key(path, max_w, max_h)
         cached = self._display_cache.get(cache_key)
         if cached is not None:
-            self._current_image_pil = cached
             self._draw_image(cached)
             self.status_var.set(f"{self.index + 1}/{len(self.images)} — {path.name}")
             return
@@ -675,12 +926,12 @@ class App(ctk.CTk):
             try:
                 frame, err = future.result()
             except Exception as exc:
+                LOGGER.exception("Error cargando imagen %s", path)
                 frame, err = None, str(exc)
             if frame is None:
                 self.status_var.set(f"No pude abrir {path.name}: {err or 'error'}")
                 self._clear_canvas("Error")
                 return
-            self._current_image_pil = frame
             self._cache_display_image(cache_key, frame)
             self._draw_image(frame)
             if self._current_image_path == path:
@@ -690,13 +941,12 @@ class App(ctk.CTk):
             try:
                 self.after(0, _apply)
             except Exception:
-                return
+                LOGGER.debug("No se pudo despachar render de imagen", exc_info=True)
 
         future.add_done_callback(_dispatch)
 
     def _clear_canvas(self, text: str | None = None) -> None:
         self._photo = None
-        self._current_image_pil = None
         self.canvas.delete("all")
         cw = max(1, int(self.canvas.winfo_width()))
         ch = max(1, int(self.canvas.winfo_height()))
@@ -714,10 +964,7 @@ class App(ctk.CTk):
     def _rel(self, path: Path) -> str:
         if not self.folder:
             return str(path)
-        try:
-            return str(path.relative_to(self.folder))
-        except Exception:
-            return str(path)
+        return _safe_relative(path, self.folder)
 
     def _is_video(self, path: Path) -> bool:
         return path.suffix.lower() in VIDEO_EXTS
@@ -726,6 +973,7 @@ class App(ctk.CTk):
         try:
             size = self._format_size(path.stat().st_size)
         except Exception:
+            LOGGER.debug("No se pudo leer tamano de %s", path, exc_info=True)
             size = "?"
         return f"Video: {path.name}\nTamano: {size}"
 
@@ -767,11 +1015,40 @@ class App(ctk.CTk):
             else:
                 self._vlc_player.set_xwindow(handle)
         except Exception:
+            LOGGER.debug("No se pudo asignar salida de video VLC", exc_info=True)
+
+    def _start_vlc_event_poller(self) -> None:
+        if self._vlc_event_job is not None or self._is_closing:
             return
+        self._vlc_event_job = self.after(120, self._process_vlc_events)
+
+    def _cancel_vlc_event_poller(self) -> None:
+        if self._vlc_event_job is None:
+            return
+        try:
+            self.after_cancel(self._vlc_event_job)
+        except Exception:
+            LOGGER.debug("No se pudo cancelar poller de VLC", exc_info=True)
+        self._vlc_event_job = None
+
+    def _process_vlc_events(self) -> None:
+        self._vlc_event_job = None
+        if self._is_closing:
+            return
+        while True:
+            try:
+                event_name, session_id = self._vlc_events.get_nowait()
+            except queue.Empty:
+                break
+            if event_name == "end":
+                self._restart_video_if_current(session_id)
+        self._start_vlc_event_poller()
 
     def _on_vlc_end(self, _event) -> None:
-        session_id = self._video_session
-        self.after(0, lambda: self._restart_video_if_current(session_id))
+        try:
+            self._vlc_events.put(("end", self._video_session))
+        except Exception:
+            LOGGER.exception("No se pudo registrar evento de fin de video")
 
     def _restart_video_if_current(self, session_id: int) -> None:
         if self._is_closing or not self._vlc_player or self._video_path is None:
@@ -784,7 +1061,7 @@ class App(ctk.CTk):
             self.play_pause_text.set("Pausa")
             self._start_video_updates(self._video_session)
         except Exception:
-            pass
+            LOGGER.exception("No se pudo reiniciar video")
 
     def _play_video(self, path: Path) -> None:
         if not self._vlc_player or not self._vlc_instance:
@@ -814,7 +1091,7 @@ class App(ctk.CTk):
             try:
                 self._vlc_player.stop()
             except Exception:
-                pass
+                LOGGER.debug("No se pudo detener VLC", exc_info=True)
         self._video_path = None
         self._duration_ms = 0
         self._progress_var.set(0.0)
@@ -831,7 +1108,7 @@ class App(ctk.CTk):
             try:
                 self.after_cancel(self._video_update_job)
             except Exception:
-                pass
+                LOGGER.debug("No se pudo cancelar _video_update_job", exc_info=True)
         self._video_update_job = None
 
     def _update_video_ui(self, session_id: int) -> None:
@@ -846,6 +1123,7 @@ class App(ctk.CTk):
             length = self._vlc_player.get_length()
             current = self._vlc_player.get_time()
         except Exception:
+            LOGGER.debug("No se pudo leer estado de reproduccion VLC", exc_info=True)
             return
         if length > 0:
             if length != self._duration_ms:
@@ -867,7 +1145,7 @@ class App(ctk.CTk):
             try:
                 self._vlc_player.set_time(target)
             except Exception:
-                pass
+                LOGGER.debug("No se pudo ajustar seek de VLC", exc_info=True)
         self._seeking = False
 
     def _on_seek_change(self, value: str) -> None:
@@ -887,7 +1165,7 @@ class App(ctk.CTk):
             try:
                 self._vlc_player.audio_set_volume(int(value))
             except Exception:
-                pass
+                LOGGER.debug("No se pudo ajustar volumen VLC", exc_info=True)
 
     def _on_volume_change(self, value: str) -> None:
         try:
@@ -907,22 +1185,31 @@ class App(ctk.CTk):
             self.play_pause_text.set("Pausa")
 
     def _unique_target(self, target: Path) -> Path:
-        if not target.exists():
-            return target
-        stem = target.stem
-        suffix = target.suffix
-        parent = target.parent
-        i = 1
-        while True:
-            candidate = parent / f"{stem} ({i}){suffix}"
-            if not candidate.exists():
-                return candidate
-            i += 1
+        return unique_target_path(target)
 
-    def _request_thumb(self, path: Path, thumb_size: int) -> None:
+    def _request_thumb(
+        self,
+        path: Path,
+        thumb_size: int,
+        on_ready: Callable[[ImageTk.PhotoImage], None] | None = None,
+    ) -> None:
         key = (path, thumb_size)
-        if key in self._thumb_cache or key in self._thumb_pending or self._is_video(path):
+        cached = self._thumb_cache.get(key)
+        if cached is not None:
+            if on_ready:
+                on_ready(cached)
             return
+
+        if self._is_video(path):
+            if on_ready:
+                on_ready(self._thumb_placeholder if thumb_size <= 64 else self._review_thumb_placeholder)
+            return
+
+        if on_ready:
+            self._thumb_waiters.setdefault(key, []).append(on_ready)
+        if key in self._thumb_pending:
+            return
+
         generation = self._media_generation
         self._thumb_pending.add(key)
         future = self._worker.submit(_decode_image_for_thumb, path, thumb_size)
@@ -930,24 +1217,33 @@ class App(ctk.CTk):
         def _apply() -> None:
             self._thumb_pending.discard(key)
             if self._is_closing or generation != self._media_generation:
+                self._thumb_waiters.pop(key, None)
                 return
             try:
                 frame, _err = future.result()
             except Exception:
+                LOGGER.exception("Error creando miniatura de %s", path)
                 frame = None
             if frame is None:
+                self._thumb_waiters.pop(key, None)
                 return
             self._thumb_cache[key] = ImageTk.PhotoImage(frame)
             if len(self._thumb_cache) > 900:
                 oldest = next(iter(self._thumb_cache))
                 self._thumb_cache.pop(oldest, None)
+            callbacks = self._thumb_waiters.pop(key, [])
+            for callback in callbacks:
+                try:
+                    callback(self._thumb_cache[key])
+                except Exception:
+                    LOGGER.debug("Error aplicando callback de miniatura", exc_info=True)
             self._schedule_strip_render()
 
         def _dispatch(_fut: object) -> None:
             try:
                 self.after(0, _apply)
             except Exception:
-                return
+                LOGGER.debug("No se pudo despachar miniatura", exc_info=True)
 
         future.add_done_callback(_dispatch)
 
@@ -989,13 +1285,9 @@ class App(ctk.CTk):
             key = (path, thumb_size)
             photo = self._thumb_cache.get(key)
             if photo is None:
-                if self._is_video(path):
-                    photo = self._thumb_placeholder
-                else:
-                    photo = self._thumb_placeholder
+                photo = self._thumb_placeholder
+                if not self._is_video(path):
                     self._request_thumb(path, thumb_size)
-            elif self._is_video(path):
-                pass
 
             self.strip_canvas.create_image(x, y, image=photo, anchor="nw")
             if self._is_video(path):
@@ -1028,7 +1320,7 @@ class App(ctk.CTk):
             try:
                 self.after_cancel(self._show_job)
             except Exception:
-                pass
+                LOGGER.debug("No se pudo cancelar _show_job al abrir revisión", exc_info=True)
             self._show_job = None
         self._stop_video()
         if self._review_window and self._review_window.winfo_exists():
@@ -1083,10 +1375,8 @@ class App(ctk.CTk):
         list_frame.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
 
         self._review_selection = {}
-        self._review_thumb_refs = []
         tiles: list[ctk.CTkFrame] = []
         tile_width = 180
-        load_previews = len(review_items) <= 120
 
         for _idx, (rel, path) in enumerate(review_items, start=1):
             tile = ctk.CTkFrame(list_frame, fg_color="transparent", corner_radius=8, pady=6)
@@ -1096,23 +1386,26 @@ class App(ctk.CTk):
             self._review_selection[rel] = var
             ctk.CTkCheckBox(tile, text="", variable=var).pack(anchor="w")
 
-            preview_label = ctk.CTkLabel(tile, text="Sin vista", anchor="center", wraplength=150)
+            preview_label = ctk.CTkLabel(
+                tile,
+                text="Cargando...",
+                anchor="center",
+                wraplength=150,
+                image=self._review_thumb_placeholder,
+                compound="center",
+            )
             preview_label.pack()
+            preview_label.image = self._review_thumb_placeholder
             if self._is_video(path):
                 preview_label.configure(text="Video")
-            elif load_previews:
-                try:
-                    img = Image.open(path)
-                    thumb = img.copy()
-                    img.close()
-                    thumb.thumbnail((150, 150), Image.Resampling.LANCZOS)
-                    photo = ImageTk.PhotoImage(thumb)
-                    self._review_thumb_refs.append(photo)
-                    preview_label.configure(image=photo, text="")
-                except Exception:
-                    pass
             else:
-                preview_label.configure(text="Sin preview")
+                def _apply_thumb(photo: ImageTk.PhotoImage, label: ctk.CTkLabel = preview_label) -> None:
+                    if self._is_closing or not label.winfo_exists():
+                        return
+                    label.configure(image=photo, text="")
+                    label.image = photo
+
+                self._request_thumb(path, 150, on_ready=_apply_thumb)
 
             ctk.CTkLabel(tile, text=path.name, wraplength=160, justify="center").pack()
             ctk.CTkLabel(tile, text=rel, wraplength=160, justify="center").pack()
@@ -1154,27 +1447,18 @@ class App(ctk.CTk):
             self._review_window.destroy()
         self._review_window = None
         self._review_selection = {}
-        self._review_thumb_refs = []
 
-    def _flush_deleted_items(self) -> None:
-        if not self.folder:
-            return
-        if not self._deleted_set:
-            messagebox.showinfo("Borrar marcadas", "No hay imágenes marcadas para borrar.")
-            return
-        deleted_dir = self._deleted_dir()
-        if not deleted_dir:
-            return
-        confirmed = messagebox.askyesno(
-            "Borrar marcadas",
-            f"¿Mover {len(self._deleted_set)} imágenes ya marcadas a {DELETED_DIRNAME}?",
-        )
-        if not confirmed:
-            return
-        deleted_dir.mkdir(parents=True, exist_ok=True)
+    def _move_rel_paths_to_deleted(self, rel_paths: list[str]) -> tuple[list[str], list[str]]:
         moved: list[str] = []
         failed: list[str] = []
-        for rel in sorted(self._deleted_set):
+        if not self.folder:
+            return moved, failed
+        deleted_dir = self._deleted_dir()
+        if not deleted_dir:
+            return moved, failed
+        deleted_dir.mkdir(parents=True, exist_ok=True)
+
+        for rel in rel_paths:
             src = self.folder / rel
             if not src.exists():
                 failed.append(f"{rel} (ya no existe)")
@@ -1183,17 +1467,42 @@ class App(ctk.CTk):
             try:
                 shutil.move(str(src), str(target))
             except Exception as exc:
+                LOGGER.exception("No se pudo mover %s a %s", src, target)
                 failed.append(f"{rel} ({exc})")
                 continue
             moved.append(rel)
+        return moved, failed
+
+    def _drop_paths_from_caches(self, moved_rel_paths: set[str]) -> None:
+        if not moved_rel_paths or not self.folder:
+            return
+
+        thumb_keys = [key for key in self._thumb_cache if self._rel(key[0]) in moved_rel_paths]
+        for key in thumb_keys:
+            self._thumb_cache.pop(key, None)
+            self._thumb_waiters.pop(key, None)
+            self._thumb_pending.discard(key)
+
+        display_keys = [key for key in self._display_cache if self._rel(key[0]) in moved_rel_paths]
+        for key in display_keys:
+            self._display_cache.pop(key, None)
+
+    def _apply_move_results(self, moved: list[str], unselected: list[str] | None = None) -> None:
         moved_set = set(moved)
-        self._deleted_set.difference_update(moved_set)
-        self._kept_set.difference_update(moved_set)
+        self._kept_set, self._deleted_set = update_marks_after_move(
+            self._kept_set,
+            self._deleted_set,
+            moved_set,
+            set(unselected or []),
+        )
         self.images = [p for p in self.images if self._rel(p) not in moved_set]
+        self._drop_paths_from_caches(moved_set)
         if self.index >= len(self.images):
             self.index = max(0, len(self.images) - 1)
         self._save_state()
         self._history.clear()
+
+    def _refresh_after_move(self, moved: list[str], failed: list[str]) -> None:
         if failed:
             messagebox.showwarning(
                 "Borrado parcial",
@@ -1208,6 +1517,25 @@ class App(ctk.CTk):
         else:
             self._clear_canvas("Sin imágenes")
             self.strip_canvas.delete("all")
+
+    def _flush_deleted_items(self) -> None:
+        if not self.folder:
+            return
+        if not self._deleted_set:
+            messagebox.showinfo("Borrar marcadas", "No hay imágenes marcadas para borrar.")
+            return
+        if not self._deleted_dir():
+            return
+        confirmed = messagebox.askyesno(
+            "Borrar marcadas",
+            f"¿Mover {len(self._deleted_set)} imágenes ya marcadas a {DELETED_DIRNAME}?",
+        )
+        if not confirmed:
+            return
+        moved, failed = self._move_rel_paths_to_deleted(sorted(self._deleted_set))
+        self._apply_move_results(moved)
+        self._close_review_window()
+        self._refresh_after_move(moved, failed)
 
     def _show_about(self) -> None:
         messagebox.showinfo(
@@ -1227,8 +1555,7 @@ class App(ctk.CTk):
     def _delete_selected_from_review(self) -> None:
         if not self.folder:
             return
-        deleted_dir = self._deleted_dir()
-        if not deleted_dir:
+        if not self._deleted_dir():
             return
         selected = [rel for rel, var in self._review_selection.items() if var.get()]
         unselected = [rel for rel, var in self._review_selection.items() if not var.get()]
@@ -1238,50 +1565,10 @@ class App(ctk.CTk):
         if not messagebox.askyesno("Confirmar", f"¿Mover {len(selected)} imágenes a {DELETED_DIRNAME}?"):
             return
 
-        deleted_dir.mkdir(parents=True, exist_ok=True)
-        moved: list[str] = []
-        failed: list[str] = []
-        for rel in selected:
-            src = self.folder / rel
-            if not src.exists():
-                failed.append(f"{rel} (ya no existe)")
-                continue
-            target = self._unique_target(deleted_dir / src.name)
-            try:
-                shutil.move(str(src), str(target))
-            except Exception as exc:
-                failed.append(f"{rel} ({exc})")
-                continue
-            moved.append(rel)
-
-        moved_set = set(moved)
-        unselected_set = set(unselected)
-        if unselected:
-            for rel in unselected:
-                self._kept_set.add(rel)
-        self._deleted_set.difference_update(moved_set)
-        self._deleted_set.difference_update(unselected_set)
-        self.images = [p for p in self.images if self._rel(p) not in moved_set]
-        if self.index >= len(self.images):
-            self.index = max(0, len(self.images) - 1)
-        self._save_state()
-        self._history.clear()
+        moved, failed = self._move_rel_paths_to_deleted(selected)
+        self._apply_move_results(moved, unselected=unselected)
         self._close_review_window()
-
-        if failed:
-            messagebox.showwarning(
-                "Borrado parcial",
-                "Algunas imágenes no se pudieron mover:\n" + "\n".join(failed[:10]),
-            )
-        if moved:
-            self.status_var.set(f"Movidas {len(moved)} imágenes a {DELETED_DIRNAME}.")
-        else:
-            self.status_var.set("No se movió ninguna imagen.")
-        if self.images:
-            self._schedule_show_current()
-        else:
-            self._clear_canvas("Sin imágenes")
-            self.strip_canvas.delete("all")
+        self._refresh_after_move(moved, failed)
 
     def _on_close(self) -> None:
         if messagebox.askokcancel("Salir", "¿Salir de la app?"):
@@ -1291,22 +1578,25 @@ class App(ctk.CTk):
                 try:
                     self.after_cancel(self._resize_job)
                 except Exception:
-                    pass
+                    LOGGER.debug("No se pudo cancelar _resize_job al cerrar", exc_info=True)
                 self._resize_job = None
             if self._strip_render_job is not None:
                 try:
                     self.after_cancel(self._strip_render_job)
                 except Exception:
-                    pass
+                    LOGGER.debug("No se pudo cancelar _strip_render_job al cerrar", exc_info=True)
                 self._strip_render_job = None
             if self._show_job is not None:
                 try:
                     self.after_cancel(self._show_job)
                 except Exception:
-                    pass
+                    LOGGER.debug("No se pudo cancelar _show_job al cerrar", exc_info=True)
                 self._show_job = None
+            self._cancel_vlc_event_poller()
             self._stop_video()
+            self._scan_generation += 1
             self._worker.shutdown(wait=False, cancel_futures=True)
+            self._scan_worker.shutdown(wait=False, cancel_futures=True)
             self.destroy()
 
 
